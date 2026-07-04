@@ -230,3 +230,97 @@ create index idx_creators_niche_tier on creators using gin(niches) where status 
 create index idx_tasks_pending on tasks(status, priority, scheduled_at) where status = 'pending';
 ```
 
+---
+
+## worker architecture
+
+### task execution model
+
+```
+[nats jetstream] ──► [dispatcher] ──► [worker pool] ──► [job handlers]
+                                                               │
+                                         +────────────────-----+─────────────────────+
+                                         ▼                                           ▼
+                                 [success: ack]                              [transient err: nack]
+                                                                                     │
+                                                                                     ▼
+                                                                             [exponential backoff]
+                                                                                     │
+                                                                                     ▼
+                                                                             [max tries: dlq]
+```
+
+workers fetch jobs from nats jetstream. each worker is controlled by a concurrency controller using channels to manage backpressure.
+
+### fault tolerance and retries
+- transient errors: retry with exponential backoff and random jitter.
+- permanent failures: skip retries and write payloads directly to the dead letter queue stream.
+- duplicate delivery: workers query idempotency tables before starting any execution.
+
+---
+
+## scaling strategy
+
+1. modular monolith: build code inside a single go binary with strict domain division.
+2. runtime separation: run separate container pools for HTTP APIs and background workers using the same binary image.
+3. service extraction: isolate modules (like analytics) into separate services only when storage engine or CPU needs diverge.
+
+---
+
+## go specific ideas
+
+go is the perfect language for this infrastructure:
+- concurrency is native: goroutines and channels allow us to implement robust worker pools without heavy resource footprints.
+- context propagation: standard `context.Context` cancellation allows us to abort slow database queries or llm requests if a client cancels or a timeout is reached.
+- connection pools: built-in connection pooling for databases ensures we do not saturate database resources.
+- compile to single binary: simple containerization and fast deployment.
+
+---
+
+## observability
+
+- logs: json format logs using `log/slog` to easily parse logs in remote aggregators.
+- metrics: prometheus metrics tracking queue duration, token usage, and database connection counts.
+- tracing: opentelemetry tracing with trace context headers passed through nats payloads.
+
+---
+
+## failure scenarios
+
+### llm timeouts
+- mitigation: set timeout limits on outgoing HTTP client contexts and fallback to alternative models if the primary provider fails.
+
+### queue saturation
+- mitigation: apply nats jetstream consumer limits to prevent memory overflow and scale container instances dynamically based on queue depth metrics.
+
+### database outages
+- mitigation: keep events in nats queues. if database writes fail, workers nack the messages so they are re-queued until database connectivity is restored.
+
+---
+
+## tradeoffs
+
+### api protocols
+- tradeoff: rest is chosen over grpc for the API layer due to tooling familiarity and easy of debugging. hotspots can be converted to grpc later.
+
+### storage engines
+- tradeoff: postgresql is used for all records including timeseries metrics to avoid managing multiple database technologies during the early stages of development.
+
+---
+
+## future ideas
+
+- agent workflow engine: coordinate multi-step agent actions with human approval stages.
+- vector search: store profile embeddings using pgvector for semantic creator recommendations.
+- streaming aggregations: calculate campaign metrics continuously using real-time event consumer streams.
+
+---
+
+## go implementation files
+
+the codebase contains working implementations of the core architectural patterns:
+- [worker.go](worker.go): concurrent worker pool pattern.
+- [limiter.go](limiter.go): rate limiting wrapper for API providers.
+- [retry.go](retry.go): retry implementation using backoff and jitter.
+- [event.go](event.go): structured event publishing wrapper for nats.
+- [main.go](main.go): server initialization and clean system shutdown.
